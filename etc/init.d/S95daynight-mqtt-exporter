@@ -1,0 +1,48 @@
+#!/bin/sh
+
+NAME="thingino-daynight-mqtt"
+DAEMON="/usr/bin/daynight-mqtt-exporter"
+PIDFILE="/var/run/${NAME}.pid"
+
+start() {
+	[ -x "$DAEMON" ] || exit 1
+	echo "Starting $NAME"
+
+	if command -v setsid >/dev/null 2>&1; then
+		if command -v logger >/dev/null 2>&1; then
+			setsid sh -c "exec $DAEMON 2>&1 | logger -t $NAME" >/dev/null 2>&1 &
+		else
+			setsid sh -c "exec $DAEMON >/dev/null 2>&1" >/dev/null 2>&1 &
+		fi
+	else
+		if command -v logger >/dev/null 2>&1; then
+			sh -c "exec $DAEMON 2>&1 | logger -t $NAME" >/dev/null 2>&1 &
+		else
+			sh -c "exec $DAEMON >/dev/null 2>&1" >/dev/null 2>&1 &
+		fi
+	fi
+
+	echo $! > "$PIDFILE"
+}
+
+stop() {
+	echo "Stopping $NAME"
+	if [ -f "$PIDFILE" ]; then
+		PID="$(cat "$PIDFILE")"
+		kill -TERM "-$PID" 2>/dev/null || kill -TERM "$PID" 2>/dev/null
+		sleep 1
+		kill -KILL "-$PID" 2>/dev/null || kill -KILL "$PID" 2>/dev/null
+		rm -f "$PIDFILE"
+	else
+		killall "$(basename "$DAEMON")" 2>/dev/null
+	fi
+}
+
+restart() { stop; start; }
+
+case "$1" in
+	start|stop|restart) "$1" ;;
+	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+
+exit 0

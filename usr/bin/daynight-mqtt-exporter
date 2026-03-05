@@ -1,0 +1,128 @@
+#!/bin/sh
+# Export prudyntctl daynight.status -> MQTT (only on change) + HA discovery (once)
+
+CONF="/etc/send2.json"
+
+MQTT_HOST="$(jct "$CONF" get mqtt.host 2>/dev/null)"
+MQTT_PORT="$(jct "$CONF" get mqtt.port 2>/dev/null)"
+MQTT_USER="$(jct "$CONF" get mqtt.username 2>/dev/null)"
+MQTT_PASS="$(jct "$CONF" get mqtt.password 2>/dev/null)"
+
+: "${MQTT_HOST:=127.0.0.1}"
+: "${MQTT_PORT:=1883}"
+INTERVAL="${INTERVAL:-2}"
+
+HOST="$(hostname)"
+BASE_PREFIX="thingino/$HOST/daynight"
+DISC_PREFIX="homeassistant"
+
+PUB_ARGS="-h $MQTT_HOST -p $MQTT_PORT"
+[ -n "$MQTT_USER" ] && PUB_ARGS="$PUB_ARGS -u $MQTT_USER"
+[ -n "$MQTT_PASS" ] && PUB_ARGS="$PUB_ARGS -P $MQTT_PASS"
+
+STATE_DIR="/tmp/daynight-mqtt-exporter"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+DISC_DONE="$STATE_DIR/discovery.done"
+
+publish() {
+	topic="$1"
+	payload="$2"
+	mosquitto_pub $PUB_ARGS -t "$topic" -m "$payload" -r
+}
+
+# safe filename for a key (no slashes etc.)
+keyfile() {
+	echo "$1" | sed 's#[^A-Za-z0-9_.-]#_#g'
+}
+
+publish_if_changed() {
+	key="$1"
+	val="$2"
+
+	[ -z "$val" ] && return 0
+
+	fkey="$(keyfile "$key")"
+	last_file="$STATE_DIR/${fkey}.last"
+
+	last=""
+	[ -f "$last_file" ] && last="$(cat "$last_file" 2>/dev/null)"
+
+	[ "$val" = "$last" ] && return 0
+
+	echo -n "$val" > "$last_file"
+	publish "$BASE_PREFIX/$key" "$val"
+}
+
+extract_num() {
+	# $1=key $2=json
+	echo "$2" | grep -o "\"$1\":[0-9-]*" | head -1 | cut -d: -f2
+}
+
+extract_str() {
+	# $1=key $2=json  -> string value
+	echo "$2" | grep -o "\"$1\":\"[^\"]*\"" | head -1 | sed "s/\"$1\":\"//; s/\"$//"
+}
+
+publish_discovery_once() {
+	[ -f "$DISC_DONE" ] && return 0
+
+	device_json="{\"identifiers\":[\"thingino-$HOST\"],\"name\":\"Thingino $HOST\",\"manufacturer\":\"Thingino\",\"model\":\"$HOST\"}"
+
+	for key in brightness_percent ev gb gr total_gain ae_luma awb_color_temp total_gain_night_threshold total_gain_day_threshold; do
+		object_id="daynight_${key}"
+		unique_id="${HOST}_daynight_${key}"
+		state_topic="$BASE_PREFIX/$key"
+		cfg_topic="$DISC_PREFIX/sensor/thingino_${HOST}/${object_id}/config"
+
+		cfg="{\"name\":\"$HOST daynight $key\",\"unique_id\":\"$unique_id\",\"state_topic\":\"$state_topic\",\"device\":$device_json"
+
+		case "$key" in
+			brightness_percent)
+				cfg="$cfg,\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\""
+				;;
+			*)
+				cfg="$cfg,\"state_class\":\"measurement\""
+				;;
+		esac
+
+		cfg="$cfg}"
+		publish "$cfg_topic" "$cfg"
+	done
+
+	# mode (string)
+	key="mode"
+	object_id="daynight_${key}"
+	unique_id="${HOST}_daynight_${key}"
+	state_topic="$BASE_PREFIX/$key"
+	cfg_topic="$DISC_PREFIX/sensor/thingino_${HOST}/${object_id}/config"
+	cfg="{\"name\":\"$HOST daynight $key\",\"unique_id\":\"$unique_id\",\"state_topic\":\"$state_topic\",\"device\":$device_json}"
+	publish "$cfg_topic" "$cfg"
+
+	touch "$DISC_DONE"
+}
+
+command -v prudyntctl >/dev/null 2>&1 || exit 1
+command -v mosquitto_pub >/dev/null 2>&1 || exit 1
+
+publish_discovery_once
+
+QUERY='{"daynight":{"status": null}}'
+
+while :; do
+	json="$(prudyntctl json "$QUERY" 2>/dev/null)"
+	[ -z "$json" ] && { sleep "$INTERVAL"; continue; }
+
+	# Only daynight.status fields
+	publish_if_changed brightness_percent "$(extract_num brightness_percent "$json")"
+	publish_if_changed ev                 "$(extract_num ev "$json")"
+	publish_if_changed gb                 "$(extract_num gb "$json")"
+	publish_if_changed gr                 "$(extract_num gr "$json")"
+	publish_if_changed total_gain         "$(extract_num total_gain "$json")"
+	publish_if_changed ae_luma            "$(extract_num ae_luma "$json")"
+	publish_if_changed awb_color_temp     "$(extract_num awb_color_temp "$json")"
+	publish_if_changed total_gain_night_threshold "$(extract_num total_gain_night_threshold "$json")"
+	publish_if_changed total_gain_day_threshold   "$(extract_num total_gain_day_threshold "$json")"
+	publish_if_changed mode               "$(extract_str mode "$json")"
+
+	sleep "$INTERVAL"
+done
